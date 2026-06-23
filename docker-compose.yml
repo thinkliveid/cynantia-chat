@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cynantia
+      POSTGRES_PASSWORD: cynantia
+      POSTGRES_DB: cynantia
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cynantia"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # --- Specialist: FAQ (A2A server sendiri, session persisten) ---
+  faq:
+    build: .
+    image: cynantia-chat
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://cynantia:cynantia@postgres:5432/cynantia
+    command: uvicorn cynantia_chat.agents.specialists.faq.server:a2a_app --host 0.0.0.0 --port 8002
+    expose:
+      - "8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Specialist: Math (A2A server sendiri, session persisten) ---
+  math:
+    build: .
+    image: cynantia-chat
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://cynantia:cynantia@postgres:5432/cynantia
+    command: uvicorn cynantia_chat.agents.specialists.math.server:a2a_app --host 0.0.0.0 --port 8003
+    expose:
+      - "8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Webhook: berisi orchestrator + Runner persisten, balas ke thread ---
+  webhook:
+    build: .
+    image: cynantia-chat
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://cynantia:cynantia@postgres:5432/cynantia
+      FAQ_AGENT_URL: http://faq:8002
+      MATH_AGENT_URL: http://math:8003
+      GOOGLE_SERVICE_ACCOUNT_FILE: /secrets/service-account.json
+    command: uvicorn cynantia_chat.chat.app:app --host 0.0.0.0 --port 8080
+    volumes:
+      - ./secrets:/secrets:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      faq:
+        condition: service_started
+      math:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  pgdata:
