@@ -6,6 +6,7 @@ workspace lain bisa memasang.
 
 Daftar isi:
 - [A. Deploy backend ke VPS (Docker)](#a-deploy-backend-ke-vps-docker)
+- [A2. Deploy tanpa Docker (Python + systemd)](#a2-deploy-tanpa-docker-python--systemd)
 - [B. Siapkan GCP project & service account](#b-siapkan-gcp-project--service-account)
 - [C. Reverse proxy HTTPS](#c-reverse-proxy-https-wajib)
 - [D. Konfigurasi Google Chat API](#d-konfigurasi-google-chat-api)
@@ -42,6 +43,133 @@ docker compose logs -f webhook
 
 Service `webhook` listen di `:8080` (lokal). Akses publik diberikan reverse proxy
 (langkah C). Cek sehat: `curl localhost:8080/healthz` → `{"status":"ok"}`.
+
+---
+
+## A2. Deploy tanpa Docker (Python + systemd)
+
+Alternatif menjalankan langsung di VPS (tanpa container). Empat proses: Postgres,
+specialist `faq`, specialist `math`, dan `webhook` (berisi orchestrator). Tiga
+proses Python dijalankan sebagai service systemd.
+
+Asumsi: Ubuntu/Debian, app di `/opt/cynantia-chat`, user `cynantia`.
+
+### 1. Paket sistem & user
+```bash
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv git postgresql
+sudo useradd --system --create-home --shell /usr/sbin/nologin cynantia || true
+sudo mkdir -p /opt/cynantia-chat
+sudo chown cynantia:cynantia /opt/cynantia-chat
+```
+
+### 2. Postgres native
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER cynantia WITH PASSWORD 'cynantia';
+CREATE DATABASE cynantia OWNER cynantia;
+SQL
+```
+(Tabel session dibuat otomatis oleh aplikasi saat pertama jalan.)
+
+### 3. Clone + virtualenv + install
+```bash
+sudo -u cynantia git clone <repo-mu> /opt/cynantia-chat
+cd /opt/cynantia-chat
+sudo -u cynantia python3.11 -m venv .venv
+sudo -u cynantia .venv/bin/pip install --upgrade pip
+sudo -u cynantia .venv/bin/pip install .
+```
+
+### 4. Konfigurasi `.env` (host = localhost!)
+```bash
+sudo -u cynantia cp .env.example .env
+```
+Edit `/opt/cynantia-chat/.env` — beda dari Docker, semua host = `localhost`:
+```ini
+OPENAI_API_KEY=sk-...
+AGENT_MODEL=openai/gpt-4o-mini
+DATABASE_URL=postgresql+psycopg://cynantia:cynantia@localhost:5432/cynantia
+FAQ_AGENT_URL=http://localhost:8002
+MATH_AGENT_URL=http://localhost:8003
+CHAT_AUDIENCE=          # diisi Project number (langkah B)
+```
+Taruh service account JSON di `/opt/cynantia-chat/secrets/service-account.json`
+dan set `GOOGLE_SERVICE_ACCOUNT_FILE=/opt/cynantia-chat/secrets/service-account.json`.
+
+### 5. Service systemd
+
+`/etc/systemd/system/cynantia-faq.service`:
+```ini
+[Unit]
+Description=Cynantia specialist FAQ (A2A)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+User=cynantia
+WorkingDirectory=/opt/cynantia-chat
+EnvironmentFile=/opt/cynantia-chat/.env
+ExecStart=/opt/cynantia-chat/.venv/bin/uvicorn cynantia_chat.agents.specialists.faq.server:a2a_app --host 0.0.0.0 --port 8002
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/cynantia-math.service` (sama, ganti `faq`→`math`, port `8003`):
+```ini
+[Unit]
+Description=Cynantia specialist Math (A2A)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+User=cynantia
+WorkingDirectory=/opt/cynantia-chat
+EnvironmentFile=/opt/cynantia-chat/.env
+ExecStart=/opt/cynantia-chat/.venv/bin/uvicorn cynantia_chat.agents.specialists.math.server:a2a_app --host 0.0.0.0 --port 8003
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/cynantia-webhook.service` (orchestrator; tunggu specialist):
+```ini
+[Unit]
+Description=Cynantia webhook + orchestrator
+After=network.target postgresql.service cynantia-faq.service cynantia-math.service
+Wants=cynantia-faq.service cynantia-math.service
+
+[Service]
+User=cynantia
+WorkingDirectory=/opt/cynantia-chat
+EnvironmentFile=/opt/cynantia-chat/.env
+ExecStart=/opt/cynantia-chat/.venv/bin/uvicorn cynantia_chat.chat.app:app --host 0.0.0.0 --port 8080
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 6. Aktifkan
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now cynantia-faq cynantia-math cynantia-webhook
+sudo systemctl status cynantia-webhook
+journalctl -u cynantia-webhook -f          # lihat log
+curl localhost:8080/healthz                # {"status":"ok"}
+```
+
+Lanjut ke [C. Reverse proxy HTTPS](#c-reverse-proxy-https-wajib) — sama untuk
+Docker maupun non-Docker (proxy ke `localhost:8080`).
+
+> Catatan: `webhook` menyimpan instance Runner orchestrator di memori proses.
+> Aman dijalankan 1 worker uvicorn (default). Jika ingin >1 worker untuk webhook,
+> session tetap konsisten (disimpan di Postgres), namun cukup mulai dari 1 worker.
+> Update kode: `git pull && .venv/bin/pip install . && sudo systemctl restart
+> cynantia-faq cynantia-math cynantia-webhook`.
 
 ---
 
