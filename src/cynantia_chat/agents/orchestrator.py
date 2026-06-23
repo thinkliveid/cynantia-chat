@@ -1,53 +1,40 @@
-"""Agent utama (orchestrator).
+"""Agent utama (orchestrator), in-process dengan specialist auto-discovered.
 
-Tidak menjawab sendiri — tugasnya mengenali maksud pesan lalu MENDELEGASIKAN ke
-specialist yang sesuai. Tiap specialist adalah A2A server terpisah yang diakses
-lewat `RemoteA2aAgent` (lihat agents/specialists/*/server.py).
+Tidak menjawab teknis sendiri — mengenali maksud pesan lalu MENDELEGASIKAN ke
+specialist. Specialist ditemukan otomatis dari folder `agents_config/` (lihat
+discovery.py), sehingga menambah specialist cukup dengan membuat folder + restart.
 
-Menambah specialist baru: buat folder agent+server-nya, daftarkan URL di config,
-lalu tambahkan satu `RemoteA2aAgent` ke daftar `sub_agents` di bawah.
+Daftar specialist yang tersedia disuntikkan otomatis ke instruksi orchestrator
+agar ia tahu ke mana harus mendelegasikan tanpa perlu edit manual.
 """
 
 from __future__ import annotations
 
 from google.adk.agents import LlmAgent
-from google.adk.agents.remote_a2a_agent import RemoteA2aAgent
 
+from cynantia_chat.agents.discovery import discover_specialists
 from cynantia_chat.agents.model import llm
-from cynantia_chat.config import card_url, get_settings
+from cynantia_chat.agents.prompt_loader import load_agent_config
 
 
 def build_orchestrator() -> LlmAgent:
-    settings = get_settings()
+    specialists = discover_specialists()
+    cfg = load_agent_config("orchestrator")
 
-    faq_agent = RemoteA2aAgent(
-        name="faq_agent",
-        description=(
-            "Spesialis FAQ: pertanyaan umum layanan, harga, jam operasional, "
-            "kontak, kebijakan refund."
-        ),
-        agent_card=card_url(settings.faq_agent_url),
-    )
-
-    math_agent = RemoteA2aAgent(
-        name="math_agent",
-        description="Spesialis matematika: perhitungan aritmetika dan soal numerik.",
-        agent_card=card_url(settings.math_agent_url),
-    )
+    roster = "\n".join(f"- {s.name}: {s.description}" for s in specialists)
+    instruction = cfg.instruction
+    if roster:
+        instruction += (
+            "\n\n# Specialist yang tersedia (otomatis)\n\n"
+            + roster
+            + "\n\nDelegasikan ke salah satu specialist di atas sesuai maksud "
+            "pengguna. Untuk sapaan/obrolan ringan, jawab singkat sendiri."
+        )
 
     return LlmAgent(
         name="orchestrator",
         model=llm(),
-        description="Agent utama yang merutekan pesan ke specialist yang tepat.",
-        instruction=(
-            "Kamu adalah orchestrator Cynantia di Google Chat. Tugasmu MENGENALI "
-            "maksud pesan pengguna lalu MENDELEGASIKAN ke sub-agent yang paling "
-            "sesuai:\n"
-            "- faq_agent: pertanyaan seputar layanan, harga, jam, kontak, refund.\n"
-            "- math_agent: perhitungan atau soal matematika.\n\n"
-            "Jangan menjawab teknis sendiri jika ada specialist yang lebih cocok — "
-            "delegasikan. Untuk sapaan/obrolan ringan, kamu boleh menjawab singkat "
-            "sendiri. Selalu pakai bahasa yang sama dengan pengguna."
-        ),
-        sub_agents=[faq_agent, math_agent],
+        description=cfg.description,
+        instruction=instruction,
+        sub_agents=specialists,
     )

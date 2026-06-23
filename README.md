@@ -2,10 +2,11 @@
 
 Sistem **multi-agent** untuk **Google Chat**. Sebuah **orchestrator** menerima
 mention/pesan dari space atau thread, lalu **mendelegasikan** ke **specialist**
-yang sesuai untuk menjawab. Tiap specialist adalah **A2A server sendiri** dengan
-**instruction, tools, dan memory sendiri**. Balasan dikirim **ke thread yang sama**
-dan **context per-thread persisten** (Postgres). Model lewat **OpenAI**
-(OpenAI-compatible). Deploy sebagai container di **VPS/server sendiri**.
+yang sesuai untuk menjawab. Specialist **ditemukan otomatis dari folder** —
+tambah specialist cukup dengan membuat folder berisi Markdown, lalu restart.
+Balasan dikirim **ke thread yang sama** (streaming bertahap) dan **context
+per-thread persisten** (Postgres). Model lewat **OpenAI** (OpenAI-compatible).
+Deploy sebagai container di **VPS/server sendiri**.
 
 ## Arsitektur
 
@@ -16,52 +17,149 @@ User @mention di space/thread
 Google Chat API ──event MESSAGE──► webhook (FastAPI, :8080)
         ▲                               │  ACK cepat, lalu (background):
         │                               ▼
-        │                    ┌─ Orchestrator (LlmAgent) ──┐  Runner + DatabaseSessionService
-        │                    │   delegasi via A2A          │  (Postgres: context per-thread)
-        │                    ▼                             ▼
-        │            RemoteA2aAgent                 RemoteA2aAgent
-        │                    │                             │
-        │           ┌────────┘                             └────────┐
-        │           ▼  A2A                                   A2A     ▼
-        │    faq_agent (:8002)                          math_agent (:8003)
-        │    LlmAgent + tool lookup_faq                 LlmAgent + tool calculate
-        │           │                                            │
-        └───────────┴──── balas async ke thread ◄───────────────┘
+        │              Orchestrator (LlmAgent) + Runner + DatabaseSessionService
+        │                     │   delegasi (ADK sub-agent transfer)   (Postgres)
+        │              ┌──────┴───────────────┐
+        │              ▼                       ▼
+        │        faq (LlmAgent)          math (LlmAgent)      ← auto-discovered
+        │        tool: lookup_faq        tool: calculate         dari agents_config/
+        │              │                       │
+        └──────────────┴── balas async ke thread (streaming) ──┘
               (Chat API: thread.name + REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD)
 ```
+
+Specialist berjalan **in-process** di dalam orchestrator (bukan container
+terpisah). Delegasi memakai mekanisme sub-agent native ADK.
 
 ### Service (docker-compose)
 | Service | Isi | Port |
 |---|---|---|
-| `postgres` | Penyimpanan session/memory persisten | 5432 (internal) |
-| `faq` | Specialist FAQ — A2A server (`lookup_faq`) | 8002 (internal) |
-| `math` | Specialist Math — A2A server (`calculate`) | 8003 (internal) |
-| `webhook`| Orchestrator + Runner persisten + balas ke thread | 8080 (publik) |
+| `postgres` | Penyimpanan session/context persisten | 5432 (internal) |
+| `webhook` | Orchestrator + specialist (in-process) + balas ke thread | 8080 (publik) |
 
 ## Struktur
 
 ```
+agents_config/                    # PERILAKU & DAFTAR agent diatur di sini (Markdown)
+├── orchestrator/ (AGENT.md, MEMORY.md)              # agent utama (perute)
+├── faq/                                             # specialist
+│   ├── AGENT.md, MEMORY.md
+│   └── skills/faq-lookup/SKILL.md                   # Agent Skills (agentskills.io)
+└── math/                                            # specialist
+    ├── AGENT.md, MEMORY.md
+    └── skills/arithmetic-calculator/SKILL.md
+    (buat folder baru di sini = specialist baru)
+
 src/cynantia_chat/
-├── config.py                      # konfigurasi + URL specialist
+├── config.py                      # konfigurasi (model, DB, dll.)
 ├── agents/
 │   ├── model.py                   # helper model OpenAI (LiteLLM) bersama
-│   ├── orchestrator.py            # agent utama: sub_agents = RemoteA2aAgent[...]
-│   └── specialists/
-│       ├── faq/   (agent.py + server.py)    # instruction & tool sendiri
-│       └── math/  (agent.py + server.py)    # instruction & tool sendiri
+│   ├── prompt_loader.py           # baca AGENT/MEMORY.md + skills/ (Agent Skills)
+│   ├── tools.py                   # fungsi tool + registry TOOLS
+│   ├── discovery.py               # pindai agents_config/ -> daftar specialist
+│   └── orchestrator.py            # agent utama: sub_agents = hasil discovery
 └── chat/
-    ├── app.py                     # webhook FastAPI (mention + thread + ACK)
+    ├── app.py                     # webhook FastAPI (mention + thread + streaming)
     ├── agent_client.py            # Runner(orchestrator, DatabaseSessionService)
     └── chat_client.py             # Chat API -> balas async ke thread
 ```
 
-## Menambah specialist baru
+## Menambah specialist baru (cukup folder + restart)
 
-1. Buat `agents/specialists/<nama>/agent.py` → `root_agent = LlmAgent(..., tools=[...])`.
-2. Buat `agents/specialists/<nama>/server.py` → `a2a_app = to_a2a(root_agent, port=...)`.
-3. Tambah URL & port di [config.py](src/cynantia_chat/config.py).
-4. Tambah satu `RemoteA2aAgent` ke `sub_agents` di [orchestrator.py](src/cynantia_chat/agents/orchestrator.py).
-5. Tambah satu service di [docker-compose.yml](docker-compose.yml).
+1. Buat folder `agents_config/<nama>/`.
+2. Isi `AGENT.md` (wajib). Boleh diawali frontmatter YAML:
+   ```markdown
+   ---
+   description: Ringkasan singkat — dipakai orchestrator untuk memilih specialist ini.
+   tools: [nama_tool]        # opsional; kosongkan untuk specialist tanpa tool
+   ---
+   # Peran: ...
+   ```
+3. (Opsional) `MEMORY.md` (fakta tetap) dan/atau folder `skills/` (lihat di bawah).
+4. **Restart** service (`docker compose restart webhook` atau `systemctl restart cynantia-webhook`).
+
+Orchestrator otomatis menemukan folder baru, menjadikannya specialist, dan
+menambahkannya ke daftar delegasi — **tanpa mengubah kode atau compose**.
+
+> **Tools** harus berupa fungsi Python (eksekutabel) — tidak bisa dari Markdown.
+> Specialist "folder saja" = prompt-only (tanpa tool). Untuk memberi tool: pakai
+> registry bersama di [tools.py](src/cynantia_chat/agents/tools.py) **atau**
+> auto-registrasi dari skill via `tool.entrypoint` di SKILL.md (lihat
+> [bagian Skills](#tool-dua-cara-mendaftarkan)) — yang kedua tanpa edit tools.py.
+
+## Mengatur perilaku agent lewat Markdown
+
+Tiap agent membaca konfigurasinya dari `agents_config/<nama>/`:
+
+| File | Isi | Wajib? |
+|---|---|---|
+| `AGENT.md` | Peran & instruksi (+ frontmatter `description`/`tools`) | ✅ |
+| `MEMORY.md` | Pengetahuan/fakta tetap yang selalu diingat | opsional |
+| `skills/<nama>/SKILL.md` | Skill berformat **Agent Skills** (lihat di bawah) | opsional |
+
+Digabung jadi satu instruction oleh
+[prompt_loader.py](src/cynantia_chat/agents/prompt_loader.py). Folder di-mount
+read-only di Docker, jadi edit Markdown lalu restart service (tanpa rebuild).
+Lokasi folder bisa dipindah lewat env `AGENTS_CONFIG_DIR`.
+
+### Skills (standar Agent Skills)
+
+Skill mengikuti format terbuka [agentskills.io](https://agentskills.io): satu
+folder per skill berisi `SKILL.md` dengan frontmatter `name` + `description`.
+
+```
+agents_config/faq/skills/faq-lookup/SKILL.md
+```
+```markdown
+---
+name: faq-lookup          # lowercase a-z 0-9 dan '-', sama dengan nama folder
+description: Apa yang dilakukan skill + KAPAN dipakai (≤1024 char).
+metadata:
+  tool: lookup_faq        # opsional, penanda tool terkait
+---
+# Skill: ...
+Instruksi langkah-demi-langkah, contoh, edge case.
+```
+
+- `name` & `description` **wajib**; opsional `license`, `compatibility`,
+  `metadata`, `allowed-tools`, dan `tool.entrypoint` (lihat di bawah).
+- Validasi dengan `skills-ref validate ./agents_config/faq/skills/faq-lookup`.
+- Loader menyuntikkan ringkasan tiap skill ke instruksi agent (progressive
+  disclosure disederhanakan: body skill ikut digabung).
+- Skill boleh membawa `scripts/`, `references/`, `assets/` sesuai spec.
+
+### Tool: dua cara mendaftarkan
+
+Sebuah specialist memperoleh tool dari dua sumber (digabung otomatis):
+
+1. **Registry bersama** — fungsi di [tools.py](src/cynantia_chat/agents/tools.py),
+   dirujuk lewat `tools: [nama]` di frontmatter `AGENT.md`. Cocok untuk tool yang
+   dipakai banyak agent.
+2. **Auto-registrasi dari skill** — taruh fungsi tool *self-contained* di
+   `scripts/` lalu deklarasikan di `SKILL.md`:
+   ```yaml
+   tool:
+     entrypoint: scripts/quote.py:price_quote
+   ```
+   Fungsi itu di-import & didaftarkan otomatis **tanpa menyentuh tools.py**.
+   Syarat: fungsi punya type hints + docstring dan memuat asset-nya sendiri.
+
+> Auto-registrasi meng-*import* script dari `agents_config/` saat startup — aman
+> selama folder config setara-tepercaya dengan kode (operator yang sama).
+
+**Contoh skill lengkap** (ketiga folder opsional + auto-tool) di
+`agents_config/faq/skills/price-quote/`:
+```
+price-quote/
+├── SKILL.md                    # metadata + instruksi + tool.entrypoint
+├── scripts/quote.py            # price_quote() self-contained (auto-jadi tool)
+├── references/pricing-rules.md # dokumentasi aturan diskon
+└── assets/
+    ├── price-list.json         # data harga (dimuat sendiri oleh script)
+    └── quote-template.md       # template balasan
+```
+Skill ini benar-benar fungsional: tool-nya datang langsung dari `scripts/quote.py`,
+tanpa entri apa pun di `tools.py`.
 
 > 📦 **Deploy ke VPS, pasang di Workspace, dan publikasi ke Marketplace:** lihat
 > panduan lengkap di [DEPLOY.md](DEPLOY.md).
@@ -97,23 +195,17 @@ Arahkan reverse proxy HTTPS publik → `localhost:8080`, pakai URL itu sebagai e
 
 ### Coba
 - Tambahkan app ke space, lalu:
-  - `@Cynantia berapa harga paketnya?` → diteruskan ke **faq_agent**.
-  - `@Cynantia hitung 12*(3+4)` → diteruskan ke **math_agent**.
-- Balas di thread yang sama → orchestrator mengingat context (persisten di Postgres).
+  - `@Cynantia berapa harga paketnya?` → didelegasikan ke specialist **faq**.
+  - `@Cynantia hitung 12*(3+4)` → didelegasikan ke specialist **math**.
+- Balas di thread yang sama → context diingat (persisten di Postgres).
 
 ## Pengembangan lokal (tanpa VPS)
 ```bash
 pip install -e .
 
-# Postgres lokal (atau pakai DATABASE_URL sqlite untuk coba cepat):
+# Postgres lokal, atau untuk coba cepat pakai sqlite:
 #   export DATABASE_URL="sqlite:///./cynantia.db"
 
-# Terminal 1 — specialist FAQ:
-uvicorn cynantia_chat.agents.specialists.faq.server:a2a_app --port 8002
-# Terminal 2 — specialist Math:
-uvicorn cynantia_chat.agents.specialists.math.server:a2a_app --port 8003
-# Terminal 3 — webhook (orchestrator menunjuk ke localhost):
-FAQ_AGENT_URL=http://localhost:8002 MATH_AGENT_URL=http://localhost:8003 \
 uvicorn cynantia_chat.chat.app:app --port 8080
 ```
 Ekspos `:8080` lewat tunnel (cloudflared/ngrok) agar Google Chat bisa menjangkau.
@@ -133,30 +225,27 @@ Google Chat tidak punya streaming token native, jadi disimulasikan: webhook
 membuat pesan saat potongan pertama tiba (`messages.create`) lalu mem-*patch*
 teksnya berkala (`messages.patch`) seiring jawaban mengalir.
 
-- Streaming internal aktif lewat `RunConfig(streaming_mode=StreamingMode.SSE)`
-  pada Runner orchestrator → `stream_agent()` meng-yield snapshot teks kumulatif.
+- Streaming internal aktif lewat `RunConfig(streaming_mode=StreamingMode.SSE)` →
+  `stream_agent()` meng-yield snapshot teks kumulatif.
 - Patch di-*throttle* `_MIN_PATCH_INTERVAL` (default 1 detik) di
   [app.py](src/cynantia_chat/chat/app.py) agar aman dari rate limit Chat API.
-- Lewat hop A2A ke specialist, granularitas bisa lebih kasar (per-event, tidak
-  selalu per-token); efek tetap "tumbuh bertahap", hanya langkahnya lebih besar.
-- Naikkan `_MIN_PATCH_INTERVAL` bila volume tinggi untuk mengurangi panggilan API.
+- Saat delegasi ke specialist, granularitas bisa lebih kasar (per-event); efek
+  tetap "tumbuh bertahap". Naikkan interval bila volume tinggi.
 
-## Catatan tentang persistensi & memory
+## Catatan persistensi & memory
 
-- **Context per-thread** (riwayat percakapan yang dilihat pengguna) **persisten di
-  Postgres** lewat `DatabaseSessionService` pada Runner orchestrator. `session_id` =
-  nama thread Google Chat, jadi bertahan lintas restart.
-- **Session per-specialist juga persisten**: tiap specialist di-host lewat
-  `persistent_a2a_app()` ([agents/a2a.py](src/cynantia_chat/agents/a2a.py)) yang
-  menyuntik Runner ber-`DatabaseSessionService` ke `to_a2a(..., runner=...)`. Data
-  terisolasi per `app_name` (mis. `faq_agent`, `math_agent`) di Postgres yang sama.
-- **Long-term memory lintas-sesi**: yang dipersisten di atas adalah *session state*.
-  ADK belum punya long-term `memory_service` berbasis SQL bawaan (opsi persisten saat
-  ini Vertex). `memory_service` specialist masih in-memory; cukup untuk sebagian besar
-  kasus karena konteks per-thread sudah persisten.
+- **Context per-thread** persisten di Postgres via `DatabaseSessionService`.
+  `session_id` = nama thread Google Chat → bertahan lintas restart. Karena
+  specialist berjalan in-process dalam Runner yang sama, state mereka ikut tersimpan.
+- **Long-term memory lintas-sesi**: yang dipersisten adalah *session state*. ADK
+  belum punya `memory_service` berbasis SQL bawaan (opsi persisten saat ini Vertex);
+  `memory_service` masih in-memory — cukup karena context per-thread sudah persisten.
 
-## Catatan versi
-`google-adk` / `a2a-sdk` cepat berubah. Project ini memakai abstraksi ADK
-(`to_a2a`, `RemoteA2aAgent`, `DatabaseSessionService`) yang relatif stabil. Jika ada
-perubahan API setelah upgrade, cek: `agents/specialists/*/server.py`,
-`agents/orchestrator.py`, dan `chat/agent_client.py`.
+## Catatan topologi & versi
+
+- **In-process**: orchestrator dan semua specialist jalan dalam satu pross; delegasi
+  memakai sub-agent transfer ADK (bukan protokol A2A di kabel). Pilihan ini ditukar
+  demi kemudahan "tambah folder + restart". Bila butuh tiap specialist sebagai server
+  A2A terpisah, itu topologi distributed (di luar setup ini).
+- `google-adk` cepat berubah. Titik yang perlu dicek bila ada perubahan API:
+  `agents/discovery.py`, `agents/orchestrator.py`, dan `chat/agent_client.py`.

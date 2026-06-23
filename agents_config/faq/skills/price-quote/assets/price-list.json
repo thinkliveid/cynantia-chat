@@ -1,0 +1,8 @@
+{
+  "currency": "IDR",
+  "packages": {
+    "basic": 99000,
+    "pro": 199000,
+    "enterprise": 499000
+  }
+}

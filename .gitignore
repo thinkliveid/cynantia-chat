@@ -1,8 +1,10 @@
 # Secrets & env
 .env
 secrets/
-*.json
-!.vscode/*.json
+# Kredensial Google (jangan commit). Asset .json lain (mis. skill price-list)
+# tetap boleh di-track.
+*service-account*.json
+*credentials*.json
 
 # Python
 __pycache__/

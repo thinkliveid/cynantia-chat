@@ -8,6 +8,8 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY src ./src
+# Konfigurasi agent berbasis Markdown (AGENT.md / MEMORY.md / SKILLS.md).
+COPY agents_config ./agents_config
 
 RUN pip install --upgrade pip && pip install .
 

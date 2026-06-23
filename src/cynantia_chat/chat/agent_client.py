@@ -1,7 +1,8 @@
-"""Jembatan webhook -> orchestrator (multi-agent A2A), dengan STREAMING.
+"""Jembatan webhook -> orchestrator (multi-agent), dengan STREAMING.
 
 Webhook menjalankan ORCHESTRATOR di Runner-nya. Orchestrator mendelegasikan ke
-specialist remote (RemoteA2aAgent) sesuai isi pesan.
+specialist in-process yang ditemukan otomatis dari folder agents_config/
+(lihat agents/discovery.py).
 
 Streaming: Runner dijalankan dengan StreamingMode.SSE sehingga `run_async` meng-
 yield event parsial. `stream_agent` mengubahnya menjadi rangkaian SNAPSHOT teks
